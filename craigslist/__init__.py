@@ -1,16 +1,37 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# pylint: disable=C0103
+
+"""
+
+craigslist module.
+
+"""
+
+
+from __future__ import absolute_import, print_function
 from bs4 import BeautifulSoup
 import logging
-from Queue import Queue
+try:
+    # Queue module renamed in py3k:
+    from queue import Queue
+except ImportError:
+    from Queue import Queue
 import requests
 from requests.exceptions import RequestException
 from threading import Thread
-from urlparse import urljoin
+try:
+    from urllib.parse import urljoin
+except ImportError:
+    from urlparse import urljoin
 
-from sites import get_all_sites
+from .sites import get_all_sites
 
 # Logging
 logger = logging.getLogger('python-craiglist')
-handler = logging.StreamHandler()
+handler = logging.StreamHandler()   # TODO: Not sure this is appropriate for a library?
+# logging.basicConfig does nothing if the root logger already has handlers configured for it.
 logger.addHandler(handler)
 
 # Global
@@ -85,7 +106,7 @@ class CraigslistBase(object):
                                    'category': self.category}
 
         self.filters = {}
-        for key, value in (filters or {}).iteritems():
+        for key, value in (filters or {}).items():
             try:
                 filter = self.base_filters.get(key) or self.extra_filters[key]
                 self.filters[filter['url_key']] = filter['value'] or value
@@ -96,7 +117,8 @@ class CraigslistBase(object):
         logger.setLevel(log_level)
         handler.setLevel(log_level)
 
-    def get_results(self, limit=None, sort_by=None, geotagged=False):
+    def get_results(self, limit=None, sort_by=None, geotagged=False,
+                    details=False):
         """
         Get results from Craigslist based on the specified filters.
 
@@ -160,7 +182,10 @@ class CraigslistBase(object):
                           'has_map': 'map' in p_text,
                           'geotag': None}
 
-                if geotagged:
+                if details:
+                    self.detailed_result(result)
+                elif geotagged:
+                    # detailed_result will also add geotag info if available
                     self.geotag_result(result)
 
                 yield result
@@ -172,8 +197,70 @@ class CraigslistBase(object):
                 break
             start = total_so_far
 
+    def detailed_result(self, result):
+        """
+        This will do geotagging, AND add extra info.
+        * Adds (lat, lng) to result.
+
+        """
+        from datetime import datetime
+
+        response = requests_get(result['url'])
+        logger.info('GET %s', response.url)
+        logger.info('Response code: %s', response.status_code)
+        response.raise_for_status() # This should be the same as response.ok
+        soup = BeautifulSoup(response.content)
+
+        if result['has_map']:
+            logger.debug('Geotagging result ...')
+            map_tag = soup.find('div', {'id': 'map'})
+            if map_tag:
+                result['geotag'] = (float(map_tag.attrs['data-latitude']),
+                                    float(map_tag.attrs['data-longitude']))
+
+        # Parse 'attrgroup' paragraph:
+        attrgroup = soup.find('p', {'class':"attrgroup"})
+        if attrgroup:
+            # Find "move in date":
+            moveintag = attrgroup.find("span", {"class": "housing_movein_now property_date"})
+            if moveintag:
+                result['moveindate'] = datetime.strptime(moveintag.attrs['date'], "%Y-%m-%d")
+            else:
+                logging.debug('Result has no "housing_movein_now property_date"-class span')
+            # Find sqft:
+            import re
+            attrspans = attrgroup.find_all("span")
+            regex = re.compile(r"(\d{3,4})?ft.?")
+            try:
+                match = next(filter(None, (regex.search(tag.text) for tag in attrspans)))
+                result['sqft'] = match.group(1)
+            except StopIteration:
+                logging.debug("Result has no attr matching sq ft regex.")
+            # Find bed/bath rooms:
+            regex = re.compile(r"(\d)BR.?/.*\d.*Ba")
+            try:
+                match = next(filter(None, (regex.search(tag.text) for tag in attrspans)))
+                result['rooms'] = match.group()
+            except StopIteration:
+                logging.debug("Result has no attr matching BR/Ba regex.")
+
+        else:
+            logging.debug("Result has no attrgroup paragraph")
+
+        # Find body: <section id="postingbody">
+        postingbody = soup.find('section', {'id':"postingbody"})
+        if postingbody:
+            result['postingbody'] = postingbody.text
+        else:
+            logging.info("Result has no postingbody... (?)")
+
+        return result
+
+
     def geotag_result(self, result):
-        """ Adds (lat, lng) to result. """
+        """
+        Adds (lat, lng) to result.
+        """
 
         logger.debug('Geotagging result ...')
 
@@ -210,7 +297,7 @@ class CraigslistBase(object):
                 queue.task_done()
 
         threads = []
-        for _ in xrange(workers):
+        for _ in range(workers):
             thread = Thread(target=geotagger)
             thread.start()
             threads.append(thread)
